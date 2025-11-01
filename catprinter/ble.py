@@ -1,17 +1,17 @@
 import asyncio
 import contextlib
+import sys
 import uuid
-from typing import Optional
+from typing import Optional, Generator
 
 from bleak import BleakClient, BleakScanner
-from bleak.backends.scanner import AdvertisementData
 from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 from bleak.backends.bluezdbus.client import BleakClientBlueZDBus
-from catprinter import logger
 
-# For some reason, bleak reports the 0xaf30 service on my macOS, while it reports
-# 0xae30 (which I believe is correct) on my Raspberry Pi. This hacky workaround
-# should cover both cases.
+from catprinter import logger
+from catprinter.cmds import cmds_print_img, prepare, finish
+from catprinter.img import text_to_image
 
 POSSIBLE_SERVICE_UUIDS = [
     "0000ae30-0000-1000-8000-00805f9b34fb",
@@ -19,52 +19,32 @@ POSSIBLE_SERVICE_UUIDS = [
 ]
 
 TX_CHARACTERISTIC_UUID = "0000ae01-0000-1000-8000-00805f9b34fb"
-RX_CHARACTERISTIC_UUID = "0000ae02-0000-1000-8000-00805f9b34fb"
-
-PRINTER_READY_NOTIFICATION = b"\x51\x78\xae\x01\x01\x00\x00\x00\xff"
-
 SCAN_TIMEOUT_S = 10
-
-# Wait time after sending each chunk of data through BLE.
 WAIT_AFTER_EACH_CHUNK_S = 0.02
 
-# Wait for printer done event timeout.
-WAIT_FOR_PRINTER_DONE_TIMEOUT = 30
 
 
-async def scan(name: Optional[str], timeout: int):
+async def scan(name: Optional[str], timeout: int) -> BLEDevice:
+    """Scan for a printer by name or UUID."""
     autodiscover = not name
-    if autodiscover:
-        logger.info("⏳ Trying to auto-discover a printer...")
-    else:
-        logger.info(f"⏳ Looking for a BLE device named {name}...")
+    msg = "⏳ Auto-discovering printer..." if autodiscover else f"⏳ Searching for {name}..."
+    logger.info(msg)
 
-    def filter_fn(device: BLEDevice, adv_data: AdvertisementData):
+    def matches(device: BLEDevice, adv: AdvertisementData) -> bool:
         if autodiscover:
-            return any(
-                uuid in adv_data.service_uuids for uuid in POSSIBLE_SERVICE_UUIDS
-            )
-        else:
-            return device.name == name
+            return any(uuid in adv.service_uuids for uuid in POSSIBLE_SERVICE_UUIDS)
+        return device.name == name
 
-    device = await BleakScanner.find_device_by_filter(
-        filter_fn,
-        timeout=timeout,
-    )
-    if device is None:
-        raise RuntimeError(
-            "Unable to find printer, make sure it is turned on and in range"
-        )
-    logger.info(f"✅ Got it. Address: {device}")
+    device = await BleakScanner.find_device_by_filter(matches, timeout=timeout)
+    if not device:
+        raise RuntimeError("Printer not found. Ensure it is powered on and nearby.")
+
+    logger.info(f"✅ Found printer: {device}")
     return device
 
 
-def chunkify(data, chunk_size):
-    return (data[i : i + chunk_size] for i in range(0, len(data), chunk_size))
-
-
-async def get_device_address(device: Optional[str]):
-    # See if we were passed a string that smells like an UUID or MAC address.
+async def get_device_address(device: Optional[str]) -> str:
+    """Return BLE address or scan if needed."""
     if device:
         with contextlib.suppress(ValueError):
             return str(uuid.UUID(device))
@@ -74,52 +54,61 @@ async def get_device_address(device: Optional[str]):
     return await scan(device, timeout=SCAN_TIMEOUT_S)
 
 
-def notification_receiver_factory(event):
-    def notification_receiver(sender, data):
-        logger.debug(f"📡 Received notification: {data}")
-        if data == PRINTER_READY_NOTIFICATION:
-            event.set()
-
-    return notification_receiver
+def chunkify(data: bytes, size: int) -> Generator[bytes, None, None]:
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
 
 
-async def wait_for_printer_ready(event):
-    logger.info("⏳ Done printing. Waiting for printer to be ready...")
-    await event.wait()
-    logger.info("✅ Printer is ready, disconnecting...")
+def get_input_lines() -> Generator[str, None, None]:
+    """Yield input lines either from stdin or user typing."""
+    if not sys.stdin.isatty():
+        for line in sys.stdin:
+            yield line.rstrip("\n")
+        return
+
+    print("Enter text (type 'exit' or 'quit' to stop):")
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            break
+        if not line:
+            continue
+        if line.lower() in ("exit", "quit"):
+            break
+        yield line
 
 
-async def run_ble(data, device: Optional[str]):
+# --- Main BLE Loop ------------------------------------------------------------
+
+async def run_ble(device: Optional[str]):
     try:
         address = await get_device_address(device)
     except RuntimeError as e:
         logger.error(f"🛑 {e}")
         return
+
     logger.info(f"⏳ Connecting to {address}...")
     async with BleakClient(address) as client:
-        # XXX: BlueZ incorrectly reports a fixed MTU of 23; force MTU negotiation manually.
-        # https://bleak.readthedocs.io/en/latest/api/client.html#bleak.BleakClient.mtu_size
         if isinstance(client, BleakClientBlueZDBus):
             await client._acquire_mtu()
 
-        logger.info(f"✅ Connected: {client.is_connected}; MTU: {client.mtu_size}")
+        logger.info(f"✅ Connected. MTU: {client.mtu_size}")
         chunk_size = client.mtu_size - 3
-        event = asyncio.Event()
 
-        receive_notification = notification_receiver_factory(event)
+        for text in get_input_lines():
+            if not text:
+                continue
 
-        await client.start_notify(RX_CHARACTERISTIC_UUID, receive_notification)
+            bin_img = text_to_image(text)
 
-        logger.info(
-            f"⏳ Sending {len(data)} bytes of data in chunks of {chunk_size} bytes..."
-        )
-        for i, chunk in enumerate(chunkify(data, chunk_size)):
-            await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk)
-            await asyncio.sleep(WAIT_AFTER_EACH_CHUNK_S)
+            piped = not sys.stdin.isatty()
+            data = cmds_print_img(bin_img, skip_flush=piped)
 
-        try:
-            await asyncio.wait_for(
-                wait_for_printer_ready(event), timeout=WAIT_FOR_PRINTER_DONE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error("🛑 Timed out while waiting for printer done event. Exiting.")
+            logger.debug(f"🖨️ Printing {len(data)} bytes ({bin_img.shape[1]}x{bin_img.shape[0]} pixels)")
+
+            for chunk in chunkify(data, chunk_size):
+                await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk)
+                await asyncio.sleep(WAIT_AFTER_EACH_CHUNK_S)
+
+        logger.info("✅ Done printing.")
