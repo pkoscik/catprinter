@@ -96,6 +96,8 @@ async def run_ble(device: Optional[str]):
         logger.info(f"✅ Connected. MTU: {client.mtu_size}")
         chunk_size = client.mtu_size - 3
 
+        await client.write_gatt_char(TX_CHARACTERISTIC_UUID, prepare())
+
         for text in get_input_lines():
             if not text:
                 continue
@@ -111,4 +113,6 @@ async def run_ble(device: Optional[str]):
                 await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk)
                 await asyncio.sleep(WAIT_AFTER_EACH_CHUNK_S)
 
+        await client.write_gatt_char(TX_CHARACTERISTIC_UUID, finish())
+                
         logger.info("✅ Done printing.")

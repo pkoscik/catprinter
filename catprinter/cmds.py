@@ -107,10 +107,6 @@ def finish(feed: int = 128) -> bytearray:
 
 def cmds_print_img(img, skip_flush: bool = False):
     data = bytearray()
-    data += prepare()
-
     for row in img:
         data += cmd_print_row(row)
-
-    data += finish()
     return data
